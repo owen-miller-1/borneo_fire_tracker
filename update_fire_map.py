@@ -259,9 +259,10 @@ window.addEventListener('load', function() {{
         div.style.marginBottom = '15px';
         div.innerHTML = `
             <div style="font-size: 14px; margin-bottom: 4px;"><b>Recency</b></div>
-            <div style="width: 130px; height: 8px; border-radius: 4px; margin-bottom: 3px;
+            <div style="width: 100%; height: 8px; border-radius: 4px; margin-bottom: 3px;
                  background: linear-gradient(to right, #7f0000, #c1121f, #e5533c, #f4a582);"></div>
-            <div style="display: flex; justify-content: space-between; font-size: 11px; width: 130px; margin-bottom: 8px;">
+            <div style="display: flex; justify-content: space-between;
+            font-size: 11px; width: 100%; margin-bottom: 8px;">
                  <span>Today</span><span>3 days ago</span>
             </div>
             <div style="display: flex; align-items: center; gap: 6px;">
