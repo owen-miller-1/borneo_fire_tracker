@@ -255,8 +255,8 @@ window.addEventListener('load', function() {{
         div.style.borderRadius = '6px';
         div.style.fontFamily = 'Roboto';
         div.style.boxShadow = '0 1px 4px rgba(0,0,0,0.3)';
-        div.style.marginRight = '25px';
-        div.style.marginBottom = '25px';
+        div.style.marginRight = '15px';
+        div.style.marginBottom = '15px';
         div.innerHTML = `
             <div style="font-size: 14px; margin-bottom: 4px;"><b>Recency</b></div>
             <div style="width: 130px; height: 8px; border-radius: 4px; margin-bottom: 3px;
