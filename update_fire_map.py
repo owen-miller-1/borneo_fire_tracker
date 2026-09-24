@@ -1,88 +1,91 @@
-# update_fire_map.py
+# Imports
+import os
+import datetime
+import urllib.request
+
 import pandas as pd
 import geopandas as gpd
 import folium
-from folium import GeoJson
-import datetime
-import numpy as np
-import os
-
-MAP_KEY = os.environ['FIRMS_MAP_KEY']  # from GitHub Actions secret, not hardcoded
-SOURCE = 'VIIRS_NOAA20_NRT'
-AREA = '108.5,-4.5,119.5,7.5'
-DAY_RANGE = 5
-
-# --- Fetch fire data ---
-area_url = f'https://firms.modaps.eosdis.nasa.gov/api/area/csv/{MAP_KEY}/{SOURCE}/{AREA}/{DAY_RANGE}'
-fire_df = pd.read_csv(area_url)
-fire_gdf = gpd.GeoDataFrame(
-    fire_df, geometry=gpd.points_from_xy(fire_df.longitude, fire_df.latitude), crs='EPSG:4326'
-)
-fire_gdf = fire_gdf[fire_gdf['confidence'].isin(['n', 'h'])]
-
-# --- Load range + PA data (committed to the repo alongside the script) ---
-ape_ranges = gpd.read_file('data/Ape_ranges.shp')
-orangutan_range = ape_ranges[(ape_ranges['sci_name'] == 'Pongo pygmaeus') & (ape_ranges['presence'] == 1)]
-orangutan_range_dissolved = orangutan_range.dissolve()
-
-Indo_PAs_borneo = gpd.read_file('data/Indo_PAs_borneo.shp')  # pre-clipped, saved once
-
-fires_in_range = gpd.sjoin(fire_gdf, orangutan_range, predicate='within')
-
-# --- Build the map 
-m_fire_sized = folium.Map(location=[-1, 112], zoom_start=7, tiles=None)
-
-folium.TileLayer(
-    tiles='https://{s}.basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}.png?key=cb1_28oy_1_05571f4015c3314d60d78268',
-    attr='&copy; OpenStreetMap, &copy; CARTO',
-    subdomains='abcd', max_zoom=20, control=False
-).add_to(m_fire_sized)
-
-# Custom panes to lock stacking order, fires always render above range/PA layers,
-# regardless of add order or LayerControl toggling
-folium.map.CustomPane('pa_pane', z_index=390).add_to(m_fire_sized)
-folium.map.CustomPane('range_pane', z_index=395).add_to(m_fire_sized)
-folium.map.CustomPane('fire_pane', z_index=650).add_to(m_fire_sized)
-
 from folium.plugins import Fullscreen
 
-Fullscreen(
-    position='topleft',
-    title='Full-screen',
-    title_cancel='Exit full-screen',
-    force_separate_button=True
-).add_to(m_fire_sized)
+# --- Paths (relative to this script, so it works locally and in GitHub Actions) ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+OUTPUT_PATH = os.path.join(BASE_DIR, 'index.html')
 
+# --- Parameters ---
+MAP_KEY = os.getenv('FIRMS_MAP_KEY')
+
+if not MAP_KEY:
+    raise RuntimeError("FIRMS_MAP_KEY environment variable is not set.")
+
+AREA = '108.5,-4.5,119.5,7.5'   # Borneo bounding box: west,south,east,north
+DAY_RANGE = 3
+sources = ['VIIRS_NOAA20_NRT', 'VIIRS_NOAA21_NRT']
+
+# --- Fetch and combine fire data from multiple sources ---
+def fetch_firms(source):
+    url = f'https://firms.modaps.eosdis.nasa.gov/api/area/csv/{MAP_KEY}/{source}/{AREA}/{DAY_RANGE}'
+    # Timeout so a slow or unresponsive FIRMS server can't hang the automated run
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        df = pd.read_csv(resp)
+    required = {'latitude', 'longitude', 'frp', 'acq_date', 'confidence'}
+    if not required.issubset(df.columns):
+        raise RuntimeError(f"Unexpected FIRMS response for {source}: columns {list(df.columns)}")
+    return df
+
+all_fires = [fetch_firms(source) for source in sources]
+
+# Combine into a single DataFrame and remove duplicates
+fire_df = pd.concat(all_fires, ignore_index=True).drop_duplicates()
+
+# Convert to GeoDataFrame
+fire_gdf = gpd.GeoDataFrame(
+    fire_df,
+    geometry=gpd.points_from_xy(fire_df.longitude, fire_df.latitude),
+    crs='EPSG:4326'
+)
+
+# Filter out low-confidence detections
+fire_gdf = fire_gdf[fire_gdf['confidence'].isin(['n', 'h'])]
+
+# --- Load range + PA data ---
+orangutan_range = (
+    gpd.read_file(os.path.join(DATA_DIR, 'Bornean_orangutan_range.shp'))
+    .to_crs('EPSG:4326')
+)
+
+Indo_PAs = (
+    gpd.read_file(os.path.join(DATA_DIR, 'Indo_PAs_borneo.shp'))
+    .to_crs('EPSG:4326')
+)
+
+# Dissolve once: used for the spatial join (no duplicate matches from overlapping
+# polygons) and for drawing the range layer
 orangutan_range_dissolved = orangutan_range.dissolve()
-folium.GeoJson(
-    orangutan_range_dissolved,
-    style_function=lambda x: {
-        'fillColor': '#006400',
-        'color': '#006400',
-        'weight': 0.2,
-        'fillOpacity': 0.2
-    },
-    name='Bornean orangutan range',
-    pane='range_pane'
-).add_to(m_fire_sized)
 
-folium.GeoJson(
-    Indo_PAs_borneo,
-    style_function=lambda x: {
-        'fillColor': '#00509d',
-        'color': '#00509d',
-        'weight': 0.6,
-        'fillOpacity': 0.1
-    },
-    name='Protected areas',
-    pane='pa_pane'
-).add_to(m_fire_sized)
+# Spatial join: keep only fires within confirmed Bornean orangutan range
+fires_in_range = gpd.sjoin(
+    fire_gdf,
+    orangutan_range_dissolved[['geometry']],
+    predicate='within'
+)
 
-today = fires_in_range['acq_date'].max()
-today_dt = datetime.datetime.strptime(today, '%Y-%m-%d')
+# Filter out invalid values
+fires_in_range = fires_in_range.dropna(subset=['frp', 'acq_date']).copy()
+fires_in_range['acq_date'] = pd.to_datetime(fires_in_range['acq_date'], errors='coerce')
+fires_in_range = fires_in_range.dropna(subset=['acq_date'])
+fires_in_range['acq_date'] = fires_in_range['acq_date'].dt.strftime('%Y-%m-%d')
+
+if fires_in_range.empty:
+    print("No fires found within the orangutan range. Map not updated.")
+    raise SystemExit
+
+# --- Recency colours ---
+today_dt = datetime.datetime.strptime(fires_in_range['acq_date'].max(), '%Y-%m-%d')
 
 def recency_color(acq_date):
-    days_ago = (today_dt - datetime.datetime.strptime(acq_date, '%Y-%m-%d')).days
+    days_ago = (today_dt - datetime.datetime.strptime(str(acq_date), '%Y-%m-%d')).days
     if days_ago == 0:
         return '#7f0000'
     elif days_ago <= 1:
@@ -92,14 +95,61 @@ def recency_color(acq_date):
     else:
         return '#f4a582'
 
-frp_max = fires_in_range['frp'].max()
+# --- Sizing: uniform dots, with only high-intensity fires drawn larger ---
+BASE_R = 3          # every fire
+HIGH_R = 7          # fires above the threshold
+HIGH_FRP = 30       # MW; fixed so the legend means the same thing every day
 
-def scale_radius_log(frp, min_r=2, max_r=10):
-    log_frp = np.log1p(frp)
-    log_max = np.log1p(frp_max)
-    return min_r + (log_frp / log_max) * (max_r - min_r)
+def scale_radius(frp):
+    return HIGH_R if float(frp) > HIGH_FRP else BASE_R
 
-for row in fires_in_range.itertuples():
+# --- Map ---
+m_fire_sized = folium.Map(
+    location=[-1, 112],
+    zoom_start=7,
+    tiles=None,
+    prefer_canvas=True,
+    control_scale=True,
+)
+
+folium.TileLayer(
+    tiles='https://{s}.basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}.png?key=cb1_28oy_1_05571f4015c3314d60d78268',
+    attr='&copy; OpenStreetMap, &copy; CARTO',
+    subdomains='abcd', max_zoom=20, control=False
+).add_to(m_fire_sized)
+
+# Custom panes lock stacking order: fires always render above range/PA layers
+folium.map.CustomPane('pa_pane', z_index=390).add_to(m_fire_sized)
+folium.map.CustomPane('range_pane', z_index=395).add_to(m_fire_sized)
+folium.map.CustomPane('fire_pane', z_index=650).add_to(m_fire_sized)
+
+Fullscreen(
+    position='topleft',
+    title='Full-screen',
+    title_cancel='Exit full-screen',
+    force_separate_button=True
+).add_to(m_fire_sized)
+
+folium.GeoJson(
+    orangutan_range_dissolved,
+    style_function=lambda x: {
+        'fillColor': '#006400', 'color': '#006400', 'weight': 0.2, 'fillOpacity': 0.2
+    },
+    name='Bornean orangutan range',
+    pane='range_pane'
+).add_to(m_fire_sized)
+
+folium.GeoJson(
+    Indo_PAs,
+    style_function=lambda x: {
+        'fillColor': '#00509d', 'color': '#00509d', 'weight': 0.6, 'fillOpacity': 0.1
+    },
+    name='Protected areas',
+    pane='pa_pane'
+).add_to(m_fire_sized)
+
+# Draw lowest FRP first so the high-intensity fires end up on top
+for row in fires_in_range.sort_values('frp', ascending=True).itertuples():
     popup_html = f"""
     <div style="font-family: Roboto, sans-serif; font-size: 12px;">
         <b>Fire Detection</b><br>
@@ -108,15 +158,19 @@ for row in fires_in_range.itertuples():
         <b>Coordinates:</b> {row.latitude:.2f}, {row.longitude:.2f}
     </div>
     """
+    base_r = scale_radius(row.frp)
     folium.CircleMarker(
         [row.latitude, row.longitude],
-        radius=scale_radius_log(row.frp),
-        color=recency_color(row.acq_date),
+        radius=base_r,
+        color='#450a0a',                          # thin dark outline (weight is set by the zoom script)
+        weight=0.6,
+        opacity=0.5,
         fill=True,
-        fill_opacity=0.8,
-        weight=0,
+        fill_color=recency_color(row.acq_date),   # recency lives in the fill
+        fill_opacity=0.6,
         popup=folium.Popup(popup_html, max_width=220),
-        pane='fire_pane'
+        pane='fire_pane',
+        baseRadius=base_r
     ).add_to(m_fire_sized)
 
 folium.LayerControl(collapsed=False).add_to(m_fire_sized)
@@ -171,16 +225,29 @@ m_fire_sized.get_root().html.add_child(folium.Element("""
 </style>
 """))
 
-legend_frp_values = [3, 15, 100]  # MW
-
-low_r = scale_radius_log(3)
-mid_r = scale_radius_log(15)
-high_r = scale_radius_log(100)
+m_fire_sized.get_root().html.add_child(folium.Element("""
+<style>
+.leaflet-control-scale {
+    bottom: 25px !important;
+    left: 25px !important;
+}
+.leaflet-control-scale-line {
+    background: white;
+    border: 1px solid #000000 !important;
+    color: #333 !important;
+    font-family: Roboto, sans-serif !important;
+    font-size: 12px !important;
+    padding: 2px 6px !important;
+    border-radius: 0 0 4px 4px !important;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+}
+</style>
+"""))
 
 legend_js = f'''
 <script>
 window.addEventListener('load', function() {{
-    var legend = L.control({{position: 'bottomleft'}});
+    var legend = L.control({{position: 'bottomright'}});
     legend.onAdd = function (map) {{
         var div = L.DomUtil.create('div', 'info legend');
         div.style.background = 'white';
@@ -188,27 +255,22 @@ window.addEventListener('load', function() {{
         div.style.borderRadius = '6px';
         div.style.fontFamily = 'Roboto';
         div.style.boxShadow = '0 1px 4px rgba(0,0,0,0.3)';
+        div.style.marginRight = '25px';
+        div.style.marginBottom = '25px';
         div.innerHTML = `
-            <div style="font-size: 12px; margin-bottom: 4px;"><b>Recency</b></div>
+            <div style="font-size: 14px; margin-bottom: 4px;"><b>Recency</b></div>
             <div style="width: 130px; height: 8px; border-radius: 4px; margin-bottom: 3px;
                  background: linear-gradient(to right, #7f0000, #c1121f, #e5533c, #f4a582);"></div>
-            <div style="display: flex; justify-content: space-between; font-size: 9px; width: 130px; margin-bottom: 8px;">
-                 <span>Today</span><span>5 days ago</span>
+            <div style="display: flex; justify-content: space-between; font-size: 11px; width: 130px; margin-bottom: 8px;">
+                 <span>Today</span><span>3 days ago</span>
             </div>
-            <div style="font-size: 12px; margin-bottom: 4px;"><b>Fire intensity (FRP, MW)</b></div>
-            <div style="display: flex; align-items: center; gap: 8px;">
-                 <div style="display: flex; align-items: center;">
-                     <div style="width: {low_r*1.2}px; height: {low_r*1.2}px; border-radius: 50%; background-color: #c1121f;"></div>
-                     <span style="font-size: 9px; margin-left: 3px;">3</span>
-                 </div>
-                 <div style="display: flex; align-items: center;">
-                     <div style="width: {mid_r*1.2}px; height: {mid_r*1.2}px; border-radius: 50%; background-color: #c1121f;"></div>
-                     <span style="font-size: 9px; margin-left: 3px;">15</span>
-                 </div>
-                 <div style="display: flex; align-items: center;">
-                     <div style="width: {high_r*1.2}px; height: {high_r*1.2}px; border-radius: 50%; background-color: #c1121f;"></div>
-                     <span style="font-size: 9px; margin-left: 3px;">100</span>
-                 </div>
+            <div style="display: flex; align-items: center; gap: 6px;">
+                 <div class="frp-dot" data-r="{HIGH_R}"
+                      style="border-radius: 50%; background-color: #c1121f; opacity: 0.8; flex-shrink: 0;"></div>
+                 <span style="font-size: 12px;">High-intensity fire (&gt;{HIGH_FRP} MW)</span>
+            </div>
+            <div style="font-size: 10px; color: #555; margin-top: 6px;">
+                 Click a fire for details.
             </div>
         `;
         return div;
@@ -219,6 +281,50 @@ window.addEventListener('load', function() {{
 '''
 m_fire_sized.get_root().html.add_child(folium.Element(legend_js))
 
+# Zoom-responsive sizing. Must be added AFTER the legend script so the legend
+# dot exists when adjustMarkers() first runs.
+zoom_scale_js = f'''
+<script>
+window.addEventListener('load', function() {{
+    var map = {m_fire_sized.get_name()};
 
-m_fire_sized.save('index.html')
-print(f"Map updated: {len(fires_in_range)} fires in range, {datetime.datetime.now()}")
+    function scaleForZoom(zoom, minZoom, maxZoom, minVal, maxVal) {{
+        var t = Math.max(0, Math.min(1, (zoom - minZoom) / (maxZoom - minZoom)));
+        return minVal + t * (maxVal - minVal);
+    }}
+
+    function adjustMarkers() {{
+        var zoom = map.getZoom();
+        var t = Math.max(0, Math.min(1, (zoom - 5) / (12 - 5)));
+
+        // Power curve: stays small when zoomed out, grows quickly once zoomed in
+        var radiusScale = 0.2 + 1.6 * Math.pow(t, 1.5);
+        var opacity = 0.5 + 0.3 * t;
+        var outlineWeight = scaleForZoom(zoom, 7, 10, 0, 0.7);
+
+        map.eachLayer(function(layer) {{
+            if (layer instanceof L.CircleMarker && layer.options.baseRadius) {{
+                layer.setRadius(Math.max(1.2, layer.options.baseRadius * radiusScale));
+                layer.setStyle({{fillOpacity: opacity, weight: outlineWeight}});
+            }}
+        }});
+
+        // Keep the legend dot the same size as the high-intensity markers (min 6px so it stays readable)
+        document.querySelectorAll('.frp-dot').forEach(function(el) {{
+            var d = Math.max(6, Math.min(2 * parseFloat(el.dataset.r) * radiusScale, 40));
+            el.style.width = d + 'px';
+            el.style.height = d + 'px';
+        }});
+    }}
+
+    map.on('zoomend', adjustMarkers);
+    adjustMarkers();
+}});
+</script>
+'''
+m_fire_sized.get_root().html.add_child(folium.Element(zoom_scale_js))
+
+m_fire_sized.save(OUTPUT_PATH)
+print(f"Map updated: {len(fires_in_range)} fires in range, "
+      f"latest detection {fires_in_range['acq_date'].max()}, "
+      f"{datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M} UTC")
