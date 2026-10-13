@@ -148,6 +148,71 @@ folium.GeoJson(
     pane='pa_pane'
 ).add_to(m_fire_sized)
 
+# --- Tanjung Puting National Park: outline + label with leader line ---
+from shapely.geometry import LineString
+
+name_col = next((c for c in ['NAME', 'ORIG_NAME', 'name', 'orig_name'] if c in Indo_PAs.columns), None)
+tp = (Indo_PAs[Indo_PAs[name_col].str.contains('Tanjung Puting', case=False, na=False)]
+      if name_col else Indo_PAs.iloc[0:0])
+
+if not tp.empty:
+    minx, miny, maxx, maxy = tp.total_bounds
+    label_lon = (minx + maxx) / 2       # horizontally centred under the park
+
+    # Find where a vertical line at label_lon crosses the park, and anchor to its lowest point,
+    # so the leader line starts exactly on the boundary
+    park_geom = tp.dissolve().geometry.iloc[0]
+    cut = park_geom.intersection(LineString([(label_lon, miny - 1), (label_lon, maxy + 1)]))
+    label_lat = cut.bounds[1] if not cut.is_empty else miny
+
+    folium.GeoJson(
+        tp,
+        style_function=lambda x: {'fill': False, 'color': '#ea7a1a', 'weight': 2.2},
+        pane='range_pane',
+        control=False
+    ).add_to(m_fire_sized)
+
+    folium.map.CustomPane('label_pane', z_index=700).add_to(m_fire_sized)
+    folium.Marker(
+        [label_lat, label_lon],
+        icon=folium.DivIcon(
+            html='<div class="park-label">Tanjung Puting National Park</div>',
+            icon_size=(0, 0),
+            class_name='tp-label'
+        ),
+        pane='label_pane',
+        interactive=False
+    ).add_to(m_fire_sized)
+
+    m_fire_sized.get_root().html.add_child(folium.Element("""
+    <style>
+    .park-label {
+        position: relative;
+        width: max-content;                  /* lets translate(-50%) use the text's real width */
+        transform: translate(-50%, 0);
+        margin-top: 14px;                    /* room for the leader line */
+        white-space: nowrap;
+        font-family: Roboto, sans-serif;
+        font-size: 12px;                     /* overridden by the zoom script */
+        font-weight: 700;
+        color: #b45309;
+        text-shadow: -1px -1px 0 #fff, 1px -1px 0 #fff, -1px 1px 0 #fff, 1px 1px 0 #fff, 0 0 4px #fff;
+        pointer-events: none;
+    }
+    /* Leader line: runs from the label up to the park boundary */
+    .park-label::before {
+        content: '';
+        position: absolute;
+        left: 50%;
+        top: -14px;
+        height: 14px;
+        border-left: 1.5px solid #ea7a1a;
+    }
+    </style>
+    """))
+else:
+    print("Tanjung Puting not found in Indo_PAs; label skipped.")
+
 # Draw lowest FRP first so the high-intensity fires end up on top
 for row in fires_in_range.sort_values('frp', ascending=True).itertuples():
     popup_html = f"""
